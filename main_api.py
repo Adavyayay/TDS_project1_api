@@ -1,22 +1,17 @@
 import os
 import json
 import time
-import zipfile
-import struct
-import ast
-
-from annoy import AnnoyIndex
+import numpy as np
+import faiss
 import google.generativeai as genai
 from google.api_core.exceptions import ResourceExhausted, GoogleAPICallError
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from pathlib import Path
-
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION & INITIAL LOAD
 # ──────────────────────────────────────────────────────────────────────────────
-
 HERE        = Path(__file__).parent
 NORMAL_FILE = HERE / "normalized_docs2.json"
 EMBED_FILE  = HERE / "embeddings.npz"
@@ -27,6 +22,7 @@ CHAT_MODEL  = "gemini-1.5-flash"
 TOP_K       = 5
 
 API_KEY     = os.getenv("GOOGLE_API_KEY")
+
 if not API_KEY:
     raise RuntimeError("Set the GOOGLE_API_KEY environment variable")
 genai.configure(api_key=API_KEY)
@@ -35,105 +31,93 @@ genai.configure(api_key=API_KEY)
 with open(NORMAL_FILE, "r", encoding="utf-8") as f:
     docs = json.load(f)
 texts = [d["page_content"] for d in docs]
-metas  = [d["metadata"]     for d in docs]
+metas = [d["metadata"]     for d in docs]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PURE-PYTHON .npz → Python list loader
-# ──────────────────────────────────────────────────────────────────────────────
-def load_npz_as_list(npz_path: Path):
-    """
-    Load the 'arr_0.npy' array from a .npz archive and return
-    it as a list of lists of floats (dtype '<f4' only).
-    """
-    # 1) Extract the .npy bytes
-    with zipfile.ZipFile(npz_path, "r") as zf:
-        name = next(n for n in zf.namelist() if n.endswith("arr_0.npy"))
-        data = zf.read(name)
-
-    # 2) Parse header
-    if not data.startswith(b'\x93NUMPY'):
-        raise RuntimeError("Unexpected .npy format")
-    header_len = struct.unpack('<H', data[8:10])[0]
-    header_str = data[10:10+header_len].decode("latin1")
-    header = ast.literal_eval(header_str)
-    shape = header["shape"]           # e.g. (N, D)
-    descr = header["descr"]           # e.g. '<f4'
-    offset = 10 + header_len
-
-    # 3) Unpack raw floats
-    if descr != '<f4':
-        raise RuntimeError(f"Unsupported dtype {descr}")
-    count = shape[0] * (shape[1] if len(shape) > 1 else 1)
-    fmt = "<" + "f" * count
-    raw = data[offset:offset + 4*count]
-    flat = struct.unpack(fmt, raw)
-
-    # 4) Reshape
-    if len(shape) == 2:
-        rows, cols = shape
-        return [ list(flat[i*cols:(i+1)*cols]) for i in range(rows) ]
-    else:
-        return list(flat)
+# Load embeddings & build FAISS
+arr   = np.load(EMBED_FILE)["arr_0"].astype("float32")
+dim   = arr.shape[1]
+index = faiss.IndexFlatL2(dim)
+index.add(arr)
 
 
-# Load embeddings into a pure-Python list and build Annoy index
-arr = load_npz_as_list(EMBED_FILE)
-dim = len(arr[0])
-index = AnnoyIndex(dim, metric="euclidean")
-for i, vec in enumerate(arr):
-    index.add_item(i, vec)
-index.build(10)   # tweak tree count (10) for your speed/accuracy trade-off
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# JSON PARSER (unchanged)
-# ──────────────────────────────────────────────────────────────────────────────
+import json
 import re
+
 def parse_json_string(raw_string):
+    """
+    Attempts to extract and parse a JSON object from a string.
+    Handles cases with markdown-style backticks, bad formatting, or stray characters.
+    """
+
     try:
+        # 1. Strip markdown code block wrappers like ```json ... ```
         cleaned = re.sub(r"^```(?:json)?\n?", "", raw_string.strip(), flags=re.IGNORECASE)
         cleaned = re.sub(r"\n?```$", "", cleaned.strip())
-        return json.loads(cleaned)
-    except Exception:
+
+        # 2. Remove trailing/leading whitespace
+        cleaned = cleaned.strip()
+
+        # 3. Try to parse the cleaned string
+        parsed = json.loads(cleaned)
+        return parsed
+
+    except json.JSONDecodeError as e:
+        print("⚠️ Failed to parse JSON string:")
+        print("Error:", e)
+        print("Raw input:", raw_string)
         return None
+
+    except Exception as e:
+        print("❌ Unexpected error while parsing JSON:")
+        print("Error:", e)
+        return None
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EMBEDDING & RETRIEVAL HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
-def embed_query(text: str):
+def embed_query(text: str) -> np.ndarray:
     resp = genai.embed_content(model=EMBED_MODEL, content=[text])
     if "embeddings" in resp:
-        return resp["embeddings"][0]
-    if "data" in resp:
-        return resp["data"][0]["embedding"]
-    if "embedding" in resp:
-        return resp["embedding"]
-    raise KeyError(f"No embedding in response: {resp.keys()}")
-
+        vec = resp["embeddings"][0]
+    elif "data" in resp:
+        vec = resp["data"][0]["embedding"]
+    elif "embedding" in resp:
+        vec = resp["embedding"]
+    else:
+        raise KeyError(f"No embedding found in response: {resp.keys()}")
+    return np.array(vec, dtype="float32").reshape(1, -1)
 
 def retrieve(question: str, k: int = TOP_K):
     q_vec = embed_query(question)
-    idxs, dists = index.get_nns_by_vector(q_vec, k, include_distances=True)
+    dists, idxs = index.search(q_vec, k)
     hits = []
-    for idx, dist in zip(idxs, dists):
-        hits.append({
+    for dist, idx in zip(dists[0], idxs[0]):
+        hit = {
             "chunk_text": texts[idx],
             **metas[idx],
             "score": float(dist)
-        })
+        }
+        hits.append(hit)
     return hits
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RAG PROMPT + GENERATION
 # ──────────────────────────────────────────────────────────────────────────────
-def generate_answer(question: str) -> str:
+def generate_answer(question: str) -> dict:
     hits = retrieve(question)
-    context_block = "\n".join(
-        f"[{i+1}] \"{h['chunk_text'][:197]}...\" (Source: {h.get('source_url','')})"
-        for i, h in enumerate(hits)
-    )
+
+    # Build context block
+    lines = []
+    for i, h in enumerate(hits, 1):
+        url = h.get("source_url") or h.get("url", "")
+        snippet = h["chunk_text"].replace("\n", " ")
+        if len(snippet) > 200:
+            snippet = snippet[:197] + "..."
+        lines.append(f"[{i}] \"{snippet}\" (Source: {url})")
+    context_block = "\n".join(lines)
 
     system = (
         "You are an amazing professor of applications of data science tools with experience of 20+ years. You are replying to students on the Discourse forum to solve their problems using the context. "
@@ -161,13 +145,18 @@ def generate_answer(question: str) -> str:
         "Always output exactly one JSON object following the schema above."
         
     )
-    gen = genai.GenerativeModel(CHAT_MODEL, system_instruction=system)
+
+    gen_model = genai.GenerativeModel( CHAT_MODEL,system_instruction=(system))
+    
     try:
-        resp = gen.generate_content(user)
+        response = gen_model.generate_content(user)
     except ResourceExhausted:
         time.sleep(60)
-        resp = gen.generate_content(user)
-    return resp.text.strip()
+        response = gen_model.generate_content(user)
+
+    text = response.text.strip()
+    return (text)
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -175,27 +164,10 @@ def generate_answer(question: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI()
 
-from fastapi.responses import HTMLResponse
-
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def read_root():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>RAG API Online</title>
-    </head>
-    <body>
-        <h1>✅ Your FastAPI RAG app is running on Vercel!</h1>
-        <p>Try posting to <code>/api/</code> with a JSON question payload.</p>
-        <p><strong>Example:</strong></p>
-        <pre>{
-  "question": "What model should I use?",
-  "image": ""
-}</pre>
-    </body>
-    </html>
-    """
+    return {"message": "It works!"}
+
 
 class Query(BaseModel):
     question: str
@@ -203,8 +175,6 @@ class Query(BaseModel):
 
 @app.post("/api/")
 def api_endpoint(q: Query):
-    raw = generate_answer(q.question)
-    parsed = parse_json_string(raw)
-    if parsed is None:
-        raise HTTPException(500, "Failed to parse LLM response as JSON")
-    return parsed
+    result = generate_answer(q.question)
+    x=parse_json_string(result)
+    return x
