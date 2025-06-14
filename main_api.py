@@ -2,7 +2,7 @@ import os
 import json
 import time
 import numpy as np
-import hnswlib
+from annoy import AnnoyIndex
 import google.generativeai as genai
 from google.api_core.exceptions import ResourceExhausted, GoogleAPICallError
 from fastapi import FastAPI, HTTPException
@@ -96,7 +96,7 @@ def embed_query(text: str) -> np.ndarray:
 
 def retrieve(question: str, k: int = TOP_K):
     q_vec = embed_query(question).astype("float32")
-    idxs, dists = index.knn_query(q_vec, k=k)
+    idxs, dists = index.get_nns_by_vector(q_vec, k, include_distances=True)
     hits = []
     for dist, idx in zip(dists[0], idxs[0]):
          hit = {
