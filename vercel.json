@@ -1,9 +1,9 @@
 {
   "version": 2,
   "builds": [
-    { "src": "main_api.py", "use": "@vercel/python" }
+    { "src": "Dockerfile", "use": "@vercel/static-docker" }
   ],
   "routes": [
-    { "src": "/api/?", "dest": "main_api.py" }
+    { "src": "/api/?", "dest": "/" }
   ]
 }
