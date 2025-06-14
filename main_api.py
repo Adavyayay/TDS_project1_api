@@ -2,7 +2,7 @@ import os
 import json
 import time
 import numpy as np
-import faiss
+import hnswlib
 import google.generativeai as genai
 from google.api_core.exceptions import ResourceExhausted, GoogleAPICallError
 from fastapi import FastAPI, HTTPException
@@ -35,11 +35,13 @@ with open(NORMAL_FILE, "r", encoding="utf-8") as f:
 texts = [d["page_content"] for d in docs]
 metas = [d["metadata"]     for d in docs]
 
-# Load embeddings & build FAISS
-arr   = np.load(EMBED_FILE)["arr_0"].astype("float32")
-dim   = arr.shape[1]
-index = faiss.IndexFlatL2(dim)
-index.add(arr)
+# Load embeddings & build HNSWLIB
+arr = np.load(EMBED_FILE)["arr_0"].astype("float32")
+dim = arr.shape[1]
+index = hnswlib.Index(space="l2", dim=dim)
+index.init_index(max_elements=arr.shape[0], ef_construction=200, M=16)
+index.add_items(arr)
+index.set_ef(50)  # query-time / recall trade-off
 
 
 import json
@@ -93,16 +95,16 @@ def embed_query(text: str) -> np.ndarray:
     return np.array(vec, dtype="float32").reshape(1, -1)
 
 def retrieve(question: str, k: int = TOP_K):
-    q_vec = embed_query(question)
-    dists, idxs = index.search(q_vec, k)
+    q_vec = embed_query(question).astype("float32")
+    idxs, dists = index.knn_query(q_vec, k=k)
     hits = []
     for dist, idx in zip(dists[0], idxs[0]):
-        hit = {
-            "chunk_text": texts[idx],
-            **metas[idx],
-            "score": float(dist)
-        }
-        hits.append(hit)
+         hit = {
+             "chunk_text": texts[idx],
+             **metas[idx],
+             "score": float(dist)
+         }
+         hits.append(hit)
     return hits
 
 # ──────────────────────────────────────────────────────────────────────────────
