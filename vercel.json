@@ -4,6 +4,6 @@
     { "src": "Dockerfile", "use": "@vercel/static-docker" }
   ],
   "routes": [
-    { "src": "/api/?", "dest": "/" }
+    { "src": "/api/", "dest": "/" }
   ]
 }

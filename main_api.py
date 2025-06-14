@@ -175,9 +175,27 @@ def generate_answer(question: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI()
 
-@app.get("/")
+from fastapi.responses import HTMLResponse
+
+@app.get("/", response_class=HTMLResponse)
 def read_root():
-    return {"message": "It works!"}
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>RAG API Online</title>
+    </head>
+    <body>
+        <h1>✅ Your FastAPI RAG app is running on Vercel!</h1>
+        <p>Try posting to <code>/api/</code> with a JSON question payload.</p>
+        <p><strong>Example:</strong></p>
+        <pre>{
+  "question": "What model should I use?",
+  "image": ""
+}</pre>
+    </body>
+    </html>
+    """
 
 class Query(BaseModel):
     question: str
