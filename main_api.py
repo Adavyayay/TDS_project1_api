@@ -1,10 +1,11 @@
 import os
 import json
 import time
+import re
 import numpy as np
 from annoy import AnnoyIndex
 import google.generativeai as genai
-from google.api_core.exceptions import ResourceExhausted, GoogleAPICallError
+from google.api_core.exceptions import ResourceExhausted
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -14,74 +15,49 @@ from pathlib import Path
 # CONFIGURATION & INITIAL LOAD
 # ──────────────────────────────────────────────────────────────────────────────
 
-HERE        = Path(__file__).parent
+HERE = Path(__file__).parent
 NORMAL_FILE = HERE / "normalized_docs2.json"
-EMBED_FILE  = HERE / "embeddings.npz"
-META_FILE   = HERE / "metadata.json"
+EMBED_FILE = HERE / "embeddings.npz"
 
 EMBED_MODEL = "models/embedding-001"
-CHAT_MODEL  = "gemini-1.5-flash"
-TOP_K       = 5
+CHAT_MODEL = "gemini-1.5-flash"
+TOP_K = 5
 
-API_KEY     = os.getenv("GOOGLE_API_KEY")
-
+API_KEY = os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     raise RuntimeError("Set the GOOGLE_API_KEY environment variable")
 genai.configure(api_key=API_KEY)
 
 # Load normalized docs + metadata
-with open(NORMAL_FILE, "r", encoding="utf-8") as f:
-    docs = json.load(f)
+docs = json.loads((HERE / NORMAL_FILE.name).read_text(encoding="utf-8"))
 texts = [d["page_content"] for d in docs]
-metas = [d["metadata"]     for d in docs]
+metas = [d["metadata"] for d in docs]
 
-# Load embeddings & build HNSWLIB
+# Build Annoy index
 arr = np.load(EMBED_FILE)["arr_0"].astype("float32")
 dim = arr.shape[1]
-index = hnswlib.Index(space="l2", dim=dim)
-index.init_index(max_elements=arr.shape[0], ef_construction=200, M=16)
-index.add_items(arr)
-index.set_ef(50)  # query-time / recall trade-off
+index = AnnoyIndex(dim, metric="euclidean")
+for i, vec in enumerate(arr):
+    index.add_item(i, vec.tolist())
+index.build(10)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# UTILITIES
+# ──────────────────────────────────────────────────────────────────────────────
 
-import json
-import re
-
-def parse_json_string(raw_string):
-    """
-    Attempts to extract and parse a JSON object from a string.
-    Handles cases with markdown-style backticks, bad formatting, or stray characters.
-    """
-
+def parse_json_string(raw_string: str) -> Optional[dict]:
+    # Strip markdown code blocks and parse
+    cleaned = re.sub(r"^```(?:json)?\n?", "", raw_string.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\n?```$", "", cleaned).strip()
     try:
-        # 1. Strip markdown code block wrappers like ```json ... ```
-        cleaned = re.sub(r"^```(?:json)?\n?", "", raw_string.strip(), flags=re.IGNORECASE)
-        cleaned = re.sub(r"\n?```$", "", cleaned.strip())
-
-        # 2. Remove trailing/leading whitespace
-        cleaned = cleaned.strip()
-
-        # 3. Try to parse the cleaned string
-        parsed = json.loads(cleaned)
-        return parsed
-
-    except json.JSONDecodeError as e:
-        print("⚠️ Failed to parse JSON string:")
-        print("Error:", e)
-        print("Raw input:", raw_string)
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
         return None
-
-    except Exception as e:
-        print("❌ Unexpected error while parsing JSON:")
-        print("Error:", e)
-        return None
-
-
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EMBEDDING & RETRIEVAL HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
+
 def embed_query(text: str) -> np.ndarray:
     resp = genai.embed_content(model=EMBED_MODEL, content=[text])
     if "embeddings" in resp:
@@ -95,28 +71,28 @@ def embed_query(text: str) -> np.ndarray:
     return np.array(vec, dtype="float32").reshape(1, -1)
 
 def retrieve(question: str, k: int = TOP_K):
-    q_vec = embed_query(question).astype("float32")
+    # Annoy returns (idxs, dists)
+    q_vec = embed_query(question)[0].tolist()
     idxs, dists = index.get_nns_by_vector(q_vec, k, include_distances=True)
     hits = []
-    for dist, idx in zip(dists[0], idxs[0]):
-         hit = {
-             "chunk_text": texts[idx],
-             **metas[idx],
-             "score": float(dist)
-         }
-         hits.append(hit)
+    for idx, dist in zip(idxs, dists):
+        hits.append({
+            "chunk_text": texts[idx],
+            **metas[idx],
+            "score": float(dist)
+        })
     return hits
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RAG PROMPT + GENERATION
 # ──────────────────────────────────────────────────────────────────────────────
-def generate_answer(question: str) -> dict:
-    hits = retrieve(question)
 
+def generate_answer(question: str) -> str:
+    hits = retrieve(question)
     # Build context block
     lines = []
     for i, h in enumerate(hits, 1):
-        url = h.get("source_url") or h.get("url", "")
+        url = h.get("source_url", "") or h.get("url", "")
         snippet = h["chunk_text"].replace("\n", " ")
         if len(snippet) > 200:
             snippet = snippet[:197] + "..."
@@ -150,28 +126,23 @@ def generate_answer(question: str) -> dict:
         
     )
 
-    gen_model = genai.GenerativeModel( CHAT_MODEL,system_instruction=(system))
-    
+    gen_model = genai.GenerativeModel(CHAT_MODEL, system_instruction=system)
     try:
         response = gen_model.generate_content(user)
     except ResourceExhausted:
         time.sleep(60)
         response = gen_model.generate_content(user)
-
-    text = response.text.strip()
-    return (text)
-
-
+    return response.text.strip()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FASTAPI SETUP
 # ──────────────────────────────────────────────────────────────────────────────
+
 app = FastAPI()
 
 @app.get("/")
 def read_root():
     return {"message": "It works!"}
-
 
 class Query(BaseModel):
     question: str
@@ -179,6 +150,8 @@ class Query(BaseModel):
 
 @app.post("/api/")
 def api_endpoint(q: Query):
-    result = generate_answer(q.question)
-    x=parse_json_string(result)
-    return x
+    raw = generate_answer(q.question)
+    parsed = parse_json_string(raw)
+    if parsed is None:
+        raise HTTPException(status_code=500, detail="Failed to parse model output as JSON")
+    return parsed
