@@ -1,79 +1,119 @@
 import os
 import json
 import time
-import re
-import numpy as np
+import zipfile
+import struct
+import ast
+
 from annoy import AnnoyIndex
 import google.generativeai as genai
-from google.api_core.exceptions import ResourceExhausted
+from google.api_core.exceptions import ResourceExhausted, GoogleAPICallError
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from pathlib import Path
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION & INITIAL LOAD
 # ──────────────────────────────────────────────────────────────────────────────
 
-HERE = Path(__file__).parent
+HERE        = Path(__file__).parent
 NORMAL_FILE = HERE / "normalized_docs2.json"
-EMBED_FILE = HERE / "embeddings.npz"
+EMBED_FILE  = HERE / "embeddings.npz"
+META_FILE   = HERE / "metadata.json"
 
 EMBED_MODEL = "models/embedding-001"
-CHAT_MODEL = "gemini-1.5-flash"
-TOP_K = 5
+CHAT_MODEL  = "gemini-1.5-flash"
+TOP_K       = 5
 
-API_KEY = os.getenv("GOOGLE_API_KEY")
+API_KEY     = os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     raise RuntimeError("Set the GOOGLE_API_KEY environment variable")
 genai.configure(api_key=API_KEY)
 
 # Load normalized docs + metadata
-docs = json.loads((HERE / NORMAL_FILE.name).read_text(encoding="utf-8"))
+with open(NORMAL_FILE, "r", encoding="utf-8") as f:
+    docs = json.load(f)
 texts = [d["page_content"] for d in docs]
-metas = [d["metadata"] for d in docs]
+metas  = [d["metadata"]     for d in docs]
 
-# Build Annoy index
-arr = np.load(EMBED_FILE)["arr_0"].astype("float32")
-dim = arr.shape[1]
+# ──────────────────────────────────────────────────────────────────────────────
+# PURE-PYTHON .npz → Python list loader
+# ──────────────────────────────────────────────────────────────────────────────
+def load_npz_as_list(npz_path: Path):
+    """
+    Load the 'arr_0.npy' array from a .npz archive and return
+    it as a list of lists of floats (dtype '<f4' only).
+    """
+    # 1) Extract the .npy bytes
+    with zipfile.ZipFile(npz_path, "r") as zf:
+        name = next(n for n in zf.namelist() if n.endswith("arr_0.npy"))
+        data = zf.read(name)
+
+    # 2) Parse header
+    if not data.startswith(b'\x93NUMPY'):
+        raise RuntimeError("Unexpected .npy format")
+    header_len = struct.unpack('<H', data[8:10])[0]
+    header_str = data[10:10+header_len].decode("latin1")
+    header = ast.literal_eval(header_str)
+    shape = header["shape"]           # e.g. (N, D)
+    descr = header["descr"]           # e.g. '<f4'
+    offset = 10 + header_len
+
+    # 3) Unpack raw floats
+    if descr != '<f4':
+        raise RuntimeError(f"Unsupported dtype {descr}")
+    count = shape[0] * (shape[1] if len(shape) > 1 else 1)
+    fmt = "<" + "f" * count
+    raw = data[offset:offset + 4*count]
+    flat = struct.unpack(fmt, raw)
+
+    # 4) Reshape
+    if len(shape) == 2:
+        rows, cols = shape
+        return [ list(flat[i*cols:(i+1)*cols]) for i in range(rows) ]
+    else:
+        return list(flat)
+
+
+# Load embeddings into a pure-Python list and build Annoy index
+arr = load_npz_as_list(EMBED_FILE)
+dim = len(arr[0])
 index = AnnoyIndex(dim, metric="euclidean")
 for i, vec in enumerate(arr):
-    index.add_item(i, vec.tolist())
-index.build(10)
+    index.add_item(i, vec)
+index.build(10)   # tweak tree count (10) for your speed/accuracy trade-off
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# UTILITIES
+# JSON PARSER (unchanged)
 # ──────────────────────────────────────────────────────────────────────────────
-
-def parse_json_string(raw_string: str) -> Optional[dict]:
-    # Strip markdown code blocks and parse
-    cleaned = re.sub(r"^```(?:json)?\n?", "", raw_string.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+import re
+def parse_json_string(raw_string):
     try:
+        cleaned = re.sub(r"^```(?:json)?\n?", "", raw_string.strip(), flags=re.IGNORECASE)
+        cleaned = re.sub(r"\n?```$", "", cleaned.strip())
         return json.loads(cleaned)
-    except json.JSONDecodeError:
+    except Exception:
         return None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EMBEDDING & RETRIEVAL HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
-
-def embed_query(text: str) -> np.ndarray:
+def embed_query(text: str):
     resp = genai.embed_content(model=EMBED_MODEL, content=[text])
     if "embeddings" in resp:
-        vec = resp["embeddings"][0]
-    elif "data" in resp:
-        vec = resp["data"][0]["embedding"]
-    elif "embedding" in resp:
-        vec = resp["embedding"]
-    else:
-        raise KeyError(f"No embedding found in response: {resp.keys()}")
-    return np.array(vec, dtype="float32").reshape(1, -1)
+        return resp["embeddings"][0]
+    if "data" in resp:
+        return resp["data"][0]["embedding"]
+    if "embedding" in resp:
+        return resp["embedding"]
+    raise KeyError(f"No embedding in response: {resp.keys()}")
+
 
 def retrieve(question: str, k: int = TOP_K):
-    # Annoy returns (idxs, dists)
-    q_vec = embed_query(question)[0].tolist()
+    q_vec = embed_query(question)
     idxs, dists = index.get_nns_by_vector(q_vec, k, include_distances=True)
     hits = []
     for idx, dist in zip(idxs, dists):
@@ -84,21 +124,16 @@ def retrieve(question: str, k: int = TOP_K):
         })
     return hits
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # RAG PROMPT + GENERATION
 # ──────────────────────────────────────────────────────────────────────────────
-
 def generate_answer(question: str) -> str:
     hits = retrieve(question)
-    # Build context block
-    lines = []
-    for i, h in enumerate(hits, 1):
-        url = h.get("source_url", "") or h.get("url", "")
-        snippet = h["chunk_text"].replace("\n", " ")
-        if len(snippet) > 200:
-            snippet = snippet[:197] + "..."
-        lines.append(f"[{i}] \"{snippet}\" (Source: {url})")
-    context_block = "\n".join(lines)
+    context_block = "\n".join(
+        f"[{i+1}] \"{h['chunk_text'][:197]}...\" (Source: {h.get('source_url','')})"
+        for i, h in enumerate(hits)
+    )
 
     system = (
         "You are an amazing professor of applications of data science tools with experience of 20+ years. You are replying to students on the Discourse forum to solve their problems using the context. "
@@ -126,19 +161,18 @@ def generate_answer(question: str) -> str:
         "Always output exactly one JSON object following the schema above."
         
     )
-
-    gen_model = genai.GenerativeModel(CHAT_MODEL, system_instruction=system)
+    gen = genai.GenerativeModel(CHAT_MODEL, system_instruction=system)
     try:
-        response = gen_model.generate_content(user)
+        resp = gen.generate_content(user)
     except ResourceExhausted:
         time.sleep(60)
-        response = gen_model.generate_content(user)
-    return response.text.strip()
+        resp = gen.generate_content(user)
+    return resp.text.strip()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FASTAPI SETUP
 # ──────────────────────────────────────────────────────────────────────────────
-
 app = FastAPI()
 
 @app.get("/")
@@ -154,5 +188,5 @@ def api_endpoint(q: Query):
     raw = generate_answer(q.question)
     parsed = parse_json_string(raw)
     if parsed is None:
-        raise HTTPException(status_code=500, detail="Failed to parse model output as JSON")
+        raise HTTPException(500, "Failed to parse LLM response as JSON")
     return parsed
