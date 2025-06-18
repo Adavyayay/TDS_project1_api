@@ -13,9 +13,9 @@ from pathlib import Path
 # CONFIGURATION & INITIAL LOAD
 # ──────────────────────────────────────────────────────────────────────────────
 HERE        = Path(__file__).parent
-NORMAL_FILE = HERE / "normalized_docs2.json"
-EMBED_FILE  = HERE / "embeddings.npz"
-META_FILE   = HERE / "metadata.json"
+NORMAL_FILE = HERE / "normalized_docs21.json"
+EMBED_FILE  = HERE / "embeddings1.npz"
+META_FILE   = HERE / "metadata1.json"
 
 EMBED_MODEL = "models/embedding-001"
 CHAT_MODEL  = "gemini-1.5-flash"
